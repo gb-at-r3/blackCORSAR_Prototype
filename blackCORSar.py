@@ -4,6 +4,7 @@ import json
 import argparse
 import datetime
 import os
+import sys
 
 # Function to decode Base64 HTTP responses
 def decode_response(base64_data):
@@ -14,73 +15,69 @@ def decode_response(base64_data):
     except Exception:
         return None
 
+# Risk descriptions for compliance checks
+RISK_DESCRIPTIONS = {
+    "CORS": {
+        "CORS too open": "Allows any origin to access resources, leading to potential data exfiltration."
+    },
+    "Security Headers": {
+        "No Strict-Transport-Security": "Exposes the site to downgrade attacks and man-in-the-middle attacks.",
+        "X-Frame-Options Missing": "Makes the site vulnerable to clickjacking attacks."
+    },
+    "CSRF Protection": {
+        "SameSite Cookie Missing": "Allows cross-site request forgery attacks, letting attackers perform actions on behalf of users."
+    },
+    "CSP": {
+        "No CSP Header": "Lack of a Content Security Policy increases the risk of cross-site scripting (XSS) attacks."
+    }
+}
+
 # Function to analyze HTTP headers and detect compliance issues
-def analyze_headers(headers):
+def analyze_headers(headers, compliance_checks):
     compliance = {
-        "CORS": {
-            "CORS too open": {"tooOpen": False, "issue": ""},
-            "Allow Credentials Enabled": {"isRisky": False, "scenario": "Allows credentials sharing across origins"}
-        },
+        "CORS": {"CORS too open": {"is_vulnerable": False, "Risk": ""}},
         "Security Headers": {
-            "No Strict-Transport-Security": {"isVuln": False, "scenario": "Exposes to downgrade attack"},
-            "X-Frame-Options Missing": {"isVuln": False, "scenario": "Vulnerable to clickjacking"},
-            "X-Content-Type-Options Missing": {"isVuln": False, "scenario": "MIME sniffing risk"},
-            "Referrer-Policy Missing": {"isVuln": False, "scenario": "Potential information leakage"},
-            "Permissions-Policy Missing": {"isVuln": False, "scenario": "Browser features might be abused"}
+            "No Strict-Transport-Security": {"is_vulnerable": False, "Risk": ""},
+            "X-Frame-Options Missing": {"is_vulnerable": False, "Risk": ""}
         },
-        "CSRF Protection": {
-            "SameSite Cookie Missing": {"isVuln": False, "scenario": "Potential CSRF attack"},
-            "Secure Cookie Missing": {"isVuln": False, "scenario": "Exposed to HTTP interception"}
-        },
-        "CSP": {
-            "No CSP Header": {"isVuln": False, "scenario": "XSS not mitigated"},
-            "Unsafe Inline Scripts": {"isVuln": False, "scenario": "Potential execution of malicious scripts"}
-        }
+        "CSRF Protection": {"SameSite Cookie Missing": {"is_vulnerable": False, "Risk": ""}},
+        "CSP": {"No CSP Header": {"is_vulnerable": False, "Risk": ""}}
     }
     
     for header in headers:
         lower_header = header.lower()
         
-        if lower_header.startswith("access-control-allow-origin"):
+        if "CORS" in compliance_checks and "access-control-allow-origin" in lower_header:
             if "*" in lower_header:
-                compliance["CORS"]["CORS too open"]["tooOpen"] = True
-                compliance["CORS"]["CORS too open"]["issue"] = header
-        if lower_header.startswith("access-control-allow-credentials") and "true" in lower_header:
-            compliance["CORS"]["Allow Credentials Enabled"]["isRisky"] = True
+                compliance["CORS"]["CORS too open"]["is_vulnerable"] = True
+                compliance["CORS"]["CORS too open"]["Risk"] = RISK_DESCRIPTIONS["CORS"]["CORS too open"]
         
-        if "strict-transport-security" not in lower_header:
-            compliance["Security Headers"]["No Strict-Transport-Security"]["isVuln"] = True
-        if "x-frame-options" not in lower_header:
-            compliance["Security Headers"]["X-Frame-Options Missing"]["isVuln"] = True
-        if "x-content-type-options" not in lower_header:
-            compliance["Security Headers"]["X-Content-Type-Options Missing"]["isVuln"] = True
-        if "referrer-policy" not in lower_header:
-            compliance["Security Headers"]["Referrer-Policy Missing"]["isVuln"] = True
-        if "permissions-policy" not in lower_header:
-            compliance["Security Headers"]["Permissions-Policy Missing"]["isVuln"] = True
+        if "Security Headers" in compliance_checks and "strict-transport-security" not in lower_header:
+            compliance["Security Headers"]["No Strict-Transport-Security"]["is_vulnerable"] = True
+            compliance["Security Headers"]["No Strict-Transport-Security"]["Risk"] = RISK_DESCRIPTIONS["Security Headers"]["No Strict-Transport-Security"]
         
-        if lower_header.startswith("set-cookie"):
+        if "Security Headers" in compliance_checks and "x-frame-options" not in lower_header:
+            compliance["Security Headers"]["X-Frame-Options Missing"]["is_vulnerable"] = True
+            compliance["Security Headers"]["X-Frame-Options Missing"]["Risk"] = RISK_DESCRIPTIONS["Security Headers"]["X-Frame-Options Missing"]
+        
+        if "CSRF Protection" in compliance_checks and "set-cookie" in lower_header:
             if "samesite=" not in lower_header:
-                compliance["CSRF Protection"]["SameSite Cookie Missing"]["isVuln"] = True
-            if "secure" not in lower_header:
-                compliance["CSRF Protection"]["Secure Cookie Missing"]["isVuln"] = True
+                compliance["CSRF Protection"]["SameSite Cookie Missing"]["is_vulnerable"] = True
+                compliance["CSRF Protection"]["SameSite Cookie Missing"]["Risk"] = RISK_DESCRIPTIONS["CSRF Protection"]["SameSite Cookie Missing"]
         
-        if lower_header.startswith("content-security-policy"):
-            compliance["CSP"]["No CSP Header"]["isVuln"] = False
-            if "unsafe-inline" in lower_header:
-                compliance["CSP"]["Unsafe Inline Scripts"]["isVuln"] = True
-        else:
-            compliance["CSP"]["No CSP Header"]["isVuln"] = True
-    
-    return compliance
+        if "CSP" in compliance_checks and "content-security-policy" not in lower_header:
+            compliance["CSP"]["No CSP Header"]["is_vulnerable"] = True
+            compliance["CSP"]["No CSP Header"]["Risk"] = RISK_DESCRIPTIONS["CSP"]["No CSP Header"]
+        
+    return {key: compliance[key] for key in compliance_checks if key in compliance}
 
 # Function to parse the XML file and analyze compliance
-def parse_burp_xml(file_path):
+def parse_burp_xml(file_path, compliance_checks, verbose=False):
     try:
         tree = ET.parse(file_path)
     except ET.ParseError:
-        print("[ERROR] The XML file appears to be corrupted. Are you still sniffing glue?")
-        exit(1)
+        print("[ERROR] The XML file appears to be corrupted. Exiting.")
+        sys.exit(1)
     
     root = tree.getroot()
     results = []
@@ -89,33 +86,40 @@ def parse_burp_xml(file_path):
         url = item.find("url").text if item.find("url") is not None else "Unknown"
         response_base64 = item.find("response").text if item.find("response") is not None else ""
         
-        if response_base64:
-            decoded_response = decode_response(response_base64)
-            if decoded_response:
-                headers = decoded_response.split("\n")[:20]  # Limit to first 20 headers
-                compliance = analyze_headers(headers)
-                results.append({"url": url, "compliance": compliance, "headers": headers})
+        decoded_response = decode_response(response_base64) if response_base64 else "N/A"
+        headers = decoded_response.split("\n\n")[0].split("\n") if decoded_response else []
+        compliance = analyze_headers(headers, compliance_checks)
+        
+        result = {"url": url, "compliance": compliance}
+        if verbose:
+            result["response_headers"] = headers
+        
+        results.append(result)
     
     return results
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BlackCORSar - Web Security Compliance Analyzer")
     parser.add_argument("--input", required=True, help="Path to the Burp XML export file")
-    parser.add_argument("--output", choices=["json", "xml", "html"], default="json", help="Output format")
-    parser.add_argument("--verbose", action="store_true", help="Enable detailed explanations in the output")
+    parser.add_argument("--compliance", required=True, help="Comma-separated compliance checks: CORS,CSP,securityHeader,CSRF,all")
+    parser.add_argument("--verbose", action="store_true", help="Enable detailed output (includes headers in JSON mode)")
     
     args = parser.parse_args()
     
     if not os.path.exists(args.input):
-        print("[ERROR] Input file not found! Maybe you need an IV drip of coffee?")
-        exit(1)
+        print("[ERROR] Input file not found!")
+        sys.exit(1)
     
-    results = parse_burp_xml(args.input)
+    compliance_checks = args.compliance.split(",")
+    if "all" in compliance_checks:
+        compliance_checks = ["CORS", "Security Headers", "CSRF Protection", "CSP"]
+    
+    results = parse_burp_xml(args.input, compliance_checks, args.verbose)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"blackcorsar_{timestamp}.{args.output}"
+    output_filename = f"blackcorsar_{timestamp}.json"
     
-    with open(output_filename, "w") as f:
-        if args.output == "json":
-            json.dump(results, f, indent=4)
+    with open(output_filename, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=4)
     
     print(f"Report generated: {output_filename}")
+
